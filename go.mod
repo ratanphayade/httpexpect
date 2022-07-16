@@ -1,4 +1,4 @@
-module github.com/gavv/httpexpect/v2
+module github.com/ratanphayade/httpexpect/v2
 
 go 1.14
 
