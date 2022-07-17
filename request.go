@@ -1183,28 +1183,11 @@ func (r *Request) roundTrip() *Response {
 		transform(r.http)
 	}
 
-	var (
-		httpResp *http.Response
-		websock  *websocket.Conn
-		elapsed  time.Duration
-	)
 	if r.wsUpgrade {
-		httpResp, websock, elapsed = r.sendWebsocketRequest()
+		return r.sendWebsocketRequest()
 	} else {
-		httpResp, elapsed = r.sendRequest()
+		return r.sendRequest()
 	}
-
-	if httpResp == nil {
-		return nil
-	}
-
-	return makeResponse(responseOpts{
-		config:    r.config,
-		chain:     r.chain,
-		response:  httpResp,
-		websocket: websock,
-		rtt:       &elapsed,
-	})
 }
 
 func (r *Request) encodeRequest() bool {
@@ -1267,49 +1250,53 @@ func (r *Request) encodeWebsocketRequest() bool {
 	return true
 }
 
-func (r *Request) sendRequest() (*http.Response, time.Duration) {
+func (r *Request) sendRequest() *Response {
 	if r.chain.failed() {
-		return nil, 0
+		return nil
 	}
 
-	resp, elapsed, err := r.retryRequest(func() (*http.Response, error) {
+	resp, err := r.retryRequest(func() (*http.Response, error) {
 		return r.config.Client.Do(r.http)
 	})
 
 	if err != nil {
 		r.chain.fail(err.Error())
-		return nil, 0
+		return nil
 	}
 
-	return resp, elapsed
+	return resp
 }
 
-func (r *Request) sendWebsocketRequest() (
-	*http.Response, *websocket.Conn, time.Duration,
-) {
+func (r *Request) sendWebsocketRequest() *Response {
 	if r.chain.failed() {
-		return nil, nil, 0
+		return nil
 	}
 
 	var conn *websocket.Conn
-	resp, elapsed, err := r.retryRequest(func() (resp *http.Response, err error) {
+	resp, err := r.retryRequest(func() (resp *http.Response, err error) {
 		conn, resp, err = r.config.WebsocketDialer.Dial(
 			r.http.URL.String(), r.http.Header)
+
 		return resp, err
 	})
 
 	if err != nil && err != websocket.ErrBadHandshake {
 		r.chain.fail(err.Error())
-		return nil, nil, 0
+		return nil
 	}
 
-	return resp, conn, elapsed
+	resp.websocket = conn
+	return resp
 }
 
 func (r *Request) retryRequest(reqFunc func() (resp *http.Response, err error)) (
-	resp *http.Response, elapsed time.Duration, err error,
+	resp *Response, err error,
 ) {
-	var body []byte
+	var (
+		body     []byte
+		httpResp *http.Response
+		elapsed  time.Duration
+	)
 	if r.maxRetries > 0 && r.http.Body != nil && r.http.Body != http.NoBody {
 		body, _ = ioutil.ReadAll(r.http.Body)
 	}
@@ -1336,18 +1323,26 @@ func (r *Request) retryRequest(reqFunc func() (resp *http.Response, err error)) 
 					ctx, cancel = context.WithTimeout(context.Background(), r.timeout)
 				}
 
-				defer cancel()
+				defer func() {
+					resp = makeResponse(responseOpts{
+						config:   r.config,
+						chain:    r.chain,
+						response: httpResp,
+						rtt:      &elapsed,
+					})
+					cancel()
+				}()
 				r.http = r.http.WithContext(ctx)
 			}
 
 			start := time.Now()
-			resp, err = reqFunc()
+			httpResp, err = reqFunc()
 			elapsed = time.Since(start)
 		}()
 
 		if resp != nil {
 			for _, printer := range r.config.Printers {
-				printer.Response(resp, elapsed)
+				printer.Response(httpResp, elapsed)
 			}
 		}
 
@@ -1356,7 +1351,7 @@ func (r *Request) retryRequest(reqFunc func() (resp *http.Response, err error)) 
 			return
 		}
 
-		if !r.shouldRetry(resp, err) {
+		if !r.shouldRetry(httpResp, err) {
 			return
 		}
 
